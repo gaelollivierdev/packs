@@ -48,6 +48,10 @@ pub struct Configuration {
     pub disable_enforce_layers: bool,
     pub disable_enforce_privacy: bool,
     pub disable_enforce_visibility: bool,
+    /// Opt-in to the new `package_todo.yml` map format and the `cycle`
+    /// violation type. When false (the default), serializer emits the
+    /// legacy list form and the cycle checker is not registered.
+    pub detailed_violations: bool,
 }
 
 impl Configuration {
@@ -169,6 +173,7 @@ pub(crate) fn from_raw(
     let autoload_roots: HashMap<PathBuf, String> = raw_config.autoload_roots;
 
     let packs_first_mode = raw_config.packs_first_mode;
+    let detailed_violations = raw_config.detailed_violations;
 
     let inflections_path = absolute_root.join(
         raw_config
@@ -208,6 +213,7 @@ pub(crate) fn from_raw(
         disable_enforce_layers: false,
         disable_enforce_privacy: false,
         disable_enforce_visibility: false,
+        detailed_violations,
     })
 }
 

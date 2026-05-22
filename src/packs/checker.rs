@@ -830,16 +830,22 @@ fn get_all_violations(
 fn get_checkers(
     configuration: &Configuration,
 ) -> Vec<Box<dyn CheckerInterface + Send + Sync>> {
-    vec![
+    let mut checkers: Vec<Box<dyn CheckerInterface + Send + Sync>> = vec![
         Box::new(dependency::Checker {}),
-        Box::new(cycle::Checker::new()),
         Box::new(privacy::Checker {}),
         Box::new(visibility::Checker {}),
         Box::new(layer::Checker {
             layers: configuration.layers.clone(),
         }),
         Box::new(folder_privacy::Checker {}),
-    ]
+    ];
+    // The cycle checker is gated on `detailed_violations` because it produces
+    // a new violation type that didn't previously exist; existing projects
+    // would suddenly see violations they had no way to grandfather in.
+    if configuration.detailed_violations {
+        checkers.push(Box::new(cycle::Checker::new()));
+    }
+    checkers
 }
 
 fn remove_reference_to_dependency(

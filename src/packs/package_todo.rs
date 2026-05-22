@@ -287,6 +287,7 @@ pub fn write_violations_to_disk(
                     p,
                     package_todo,
                     configuration.packs_first_mode,
+                    configuration.detailed_violations,
                 );
             }
             None => {
@@ -397,6 +398,7 @@ pub fn merge_violations_to_disk(
                     p,
                     &merged,
                     configuration.packs_first_mode,
+                    configuration.detailed_violations,
                 );
             }
         }
@@ -422,6 +424,7 @@ pub fn lint_package_todo_yml_files(configuration: &Configuration) {
                 p,
                 &p.package_todo,
                 configuration.packs_first_mode,
+                configuration.detailed_violations,
             );
         }
     });
@@ -431,24 +434,94 @@ fn serialize_package_todo(
     responsible_pack_name: &String,
     package_todo: &PackageTodo,
     packs_first_mode: bool,
+    detailed_violations: bool,
 ) -> String {
-    let package_todo_yml = serde_yaml::to_string(&package_todo).unwrap();
+    let package_todo_yml = if detailed_violations {
+        serde_yaml::to_string(&package_todo).unwrap()
+    } else {
+        serde_yaml::to_string(&PackageTodoLegacyView(package_todo)).unwrap()
+    };
 
     // HACK: This is the other part of the hack above (search `HACK:` for more)
     let package_todo_yml = package_todo_yml.replace("'#", "\"");
     let package_todo_yml = package_todo_yml.replace("#'", "\"");
     // Render `Option::<String>::None` violation values as an empty YAML value
     // (`dependency:`) instead of the noisier `dependency: null`. Both are
-    // semantically identical in YAML; the empty form is easier to read.
-    let package_todo_yml = package_todo_yml.replace(": null\n", ":\n");
+    // semantically identical in YAML; the empty form is easier to read. Only
+    // applies in detailed mode; the legacy view emits sequences, never nulls.
+    let package_todo_yml = if detailed_violations {
+        package_todo_yml.replace(": null\n", ":\n")
+    } else {
+        package_todo_yml
+    };
     let header = header(responsible_pack_name, packs_first_mode);
     header + &package_todo_yml
+}
+
+/// Serialize-only view that renders `violations:` as a YAML sequence
+/// (legacy form) instead of a mapping. Used when `detailed_violations` is
+/// off so existing projects keep the original on-disk layout.
+struct PackageTodoLegacyView<'a>(&'a PackageTodo);
+
+impl<'a> Serialize for PackageTodoLegacyView<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let map = &self.0.violations_by_defining_pack;
+        let mut map_serializer = serializer.serialize_map(Some(map.len()))?;
+
+        for (key, value) in map {
+            // Mirror the constant-quoting hack used by the detailed
+            // serializer: serde_yaml emits keys without quotes by default,
+            // but we need quoted constant names like `"::Bar"`. Wrap each
+            // key in `#...#` and post-process the YAML text to swap the
+            // single quotes for double quotes.
+            let mut quoted_sorted: BTreeMap<String, ViolationGroupLegacyView> =
+                BTreeMap::new();
+            for (constant_name, violation_group) in value {
+                let quoted_constant_name = format!("#{}#", constant_name);
+                quoted_sorted.insert(
+                    quoted_constant_name,
+                    ViolationGroupLegacyView(violation_group),
+                );
+            }
+            let modified_key = if key == &String::from(".") {
+                String::from("#.#")
+            } else {
+                key.to_owned()
+            };
+            map_serializer.serialize_entry(&modified_key, &quoted_sorted)?;
+        }
+
+        map_serializer.end()
+    }
+}
+
+struct ViolationGroupLegacyView<'a>(&'a ViolationGroup);
+
+impl<'a> Serialize for ViolationGroupLegacyView<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ViolationGroup", 2)?;
+        // Drop the per-type detail entirely in legacy mode: emit sorted
+        // type names as a sequence. Equivalent to the old
+        // `HashSet<String>` shape after sorting.
+        let types: Vec<&String> = self.0.violations.keys().collect();
+        s.serialize_field("violations", &types)?;
+        s.serialize_field("files", &self.0.files)?;
+        s.end()
+    }
 }
 
 fn write_package_todo_to_disk(
     responsible_pack: &Pack,
     package_todo: &PackageTodo,
     packs_first_mode: bool,
+    detailed_violations: bool,
 ) {
     let package_todo_yml_absolute_filepath = responsible_pack
         .yml
@@ -464,6 +537,7 @@ fn write_package_todo_to_disk(
         &responsible_pack.name,
         package_todo,
         packs_first_mode,
+        detailed_violations,
     );
 
     std::fs::write(package_todo_yml_absolute_filepath, package_todo_yml)
@@ -651,6 +725,7 @@ packs/bar:
             &String::from("packs/foo"),
             &actual_package_todo,
             false,
+            true,
         );
 
         assert_eq!(expected, actual);
@@ -693,6 +768,7 @@ packs/bar:
             &String::from("packs/foo"),
             &actual_package_todo,
             false,
+            true,
         );
 
         assert_eq!(expected, actual);
@@ -736,9 +812,103 @@ packs/bar:
             &String::from("packs/foo"),
             &actual_package_todo,
             true,
+            true,
         );
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_serialize_legacy_form_when_detailed_violations_off() {
+        // detailed_violations = false: violations rendered as a YAML
+        // sequence, mirroring the format pks emitted before this feature.
+        let expected: String = String::from(
+            "\
+# This file contains a list of dependencies that are not part of the long term plan for the
+# 'packs/foo' package.
+# We should generally work to reduce this list over time.
+#
+# You can regenerate this file using the following command:
+#
+# bin/packwerk update-todo
+---
+packs/bar:
+  \"::Bar\":
+    violations:
+    - dependency
+    files:
+    - packs/foo/app/services/foo.rb
+  \"::BarBlah\":
+    violations:
+    - dependency
+    files:
+    - packs/foo/app/services/foo.rb
+  \"::Baz\":
+    violations:
+    - dependency
+    - privacy
+    files:
+    - packs/foo/app/services/foo.rb
+",
+        );
+
+        let actual_package_todo =
+            example_package_todo(String::from("packs/bar"));
+        let actual = serialize_package_todo(
+            &String::from("packs/foo"),
+            &actual_package_todo,
+            false,
+            false,
+        );
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_serialize_legacy_form_drops_details() {
+        // Even if violations carry details (e.g. a layer detail set by the
+        // checker), the legacy serializer should drop them. This guarantees
+        // the on-disk format stays stable when a project has detailed_violations off.
+        let mut violations: BTreeMap<String, Option<String>> = BTreeMap::new();
+        violations.insert("layer".to_string(), Some("utilities < product".to_string()));
+        violations.insert("dependency".to_string(), None);
+
+        let mut group_map = BTreeMap::new();
+        group_map.insert(
+            "::Bar".to_string(),
+            ViolationGroup {
+                violations,
+                files: BTreeSet::from([
+                    "packs/foo/app/services/foo.rb".to_string(),
+                ]),
+            },
+        );
+
+        let mut by_pack: BTreeMap<String, BTreeMap<String, ViolationGroup>> =
+            BTreeMap::new();
+        by_pack.insert("packs/bar".to_string(), group_map);
+
+        let pt = PackageTodo {
+            violations_by_defining_pack: by_pack,
+        };
+        let yml = serialize_package_todo(
+            &String::from("packs/foo"),
+            &pt,
+            false,
+            false,
+        );
+
+        assert!(
+            yml.contains("- dependency"),
+            "expected legacy sequence form: {}",
+            yml
+        );
+        assert!(yml.contains("- layer"), "expected legacy sequence form: {}", yml);
+        assert!(
+            !yml.contains("utilities < product"),
+            "legacy form must not leak detail strings: {}",
+            yml
+        );
     }
 
     #[test]

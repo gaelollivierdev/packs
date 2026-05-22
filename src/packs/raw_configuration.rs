@@ -71,6 +71,13 @@ pub(crate) struct RawConfiguration {
     // Use packs copy
     #[serde(default)]
     pub packs_first_mode: bool,
+
+    // Opt in to the new package_todo.yml format that records per-violation
+    // detail (layer pair, cycle path) and enables the `cycle` violation
+    // type. Default false to keep existing projects on the legacy list
+    // form until they explicitly migrate.
+    #[serde(default)]
+    pub detailed_violations: bool,
 }
 
 pub(crate) fn get(
