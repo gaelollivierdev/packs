@@ -36,8 +36,8 @@ fn test_update() -> Result<(), Box<dyn Error>> {
 packs/bar:
   \"::Bar\":
     violations:
-    - dependency
-    - privacy
+      dependency:
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -79,8 +79,8 @@ fn test_update_with_experimental_parser() -> Result<(), Box<dyn Error>> {
 packs/bar:
   \"::Bar\":
     violations:
-    - dependency
-    - privacy
+      dependency:
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -124,7 +124,7 @@ fn test_update_with_stale_violations() -> Result<(), Box<dyn Error>> {
 packs/bar:
   \"::Bar\":
     violations:
-    - privacy
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -169,8 +169,8 @@ fn test_update_with_packs_first_app() -> Result<(), Box<dyn Error>> {
 packs/bar:
   \"::Bar\":
     violations:
-    - dependency
-    - privacy
+      dependency:
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -240,8 +240,8 @@ fn test_update_with_file_arg() -> Result<(), Box<dyn Error>> {
 packs/bar:
   \"::Bar\":
     violations:
-    - dependency
-    - privacy
+      dependency:
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -353,7 +353,7 @@ fn test_update_with_constant_filter() -> Result<(), Box<dyn Error>> {
 packs/bar:
   \"::Bar\":
     violations:
-    - dependency
+      dependency:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -424,11 +424,11 @@ fn test_update_with_constant_filter_no_files() -> Result<(), Box<dyn Error>> {
     let actual = std::fs::read_to_string(package_todo_yml_filepath)?;
     // Should only have the dependency violation, not privacy
     assert!(
-        actual.contains("- dependency"),
+        actual.contains("dependency:"),
         "dependency violation should be present"
     );
     assert!(
-        !actual.contains("- privacy"),
+        !actual.contains("privacy:"),
         "privacy violation should NOT be present when filtered"
     );
 

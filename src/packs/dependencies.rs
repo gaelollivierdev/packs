@@ -42,7 +42,8 @@ pub fn find_dependencies(
                         let entry = implicit_dependencies
                             .entry(current_pack.name.clone())
                             .or_default();
-                        for violation_type in &violation_group.violation_types {
+                        for violation_type in violation_group.violations.keys()
+                        {
                             entry
                                 .entry(violation_type.clone())
                                 .and_modify(|e| *e += 1)
