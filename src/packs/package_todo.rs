@@ -870,7 +870,10 @@ packs/bar:
         // checker), the legacy serializer should drop them. This guarantees
         // the on-disk format stays stable when a project has detailed_violations off.
         let mut violations: BTreeMap<String, Option<String>> = BTreeMap::new();
-        violations.insert("layer".to_string(), Some("utilities < product".to_string()));
+        violations.insert(
+            "layer".to_string(),
+            Some("utilities < product".to_string()),
+        );
         violations.insert("dependency".to_string(), None);
 
         let mut group_map = BTreeMap::new();
@@ -879,7 +882,7 @@ packs/bar:
             ViolationGroup {
                 violations,
                 files: BTreeSet::from([
-                    "packs/foo/app/services/foo.rb".to_string(),
+                    "packs/foo/app/services/foo.rb".to_string()
                 ]),
             },
         );
@@ -903,7 +906,11 @@ packs/bar:
             "expected legacy sequence form: {}",
             yml
         );
-        assert!(yml.contains("- layer"), "expected legacy sequence form: {}", yml);
+        assert!(
+            yml.contains("- layer"),
+            "expected legacy sequence form: {}",
+            yml
+        );
         assert!(
             !yml.contains("utilities < product"),
             "legacy form must not leak detail strings: {}",

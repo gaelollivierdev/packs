@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::Context;
+use petgraph::algo::astar;
 use petgraph::prelude::{DiGraph, NodeIndex};
 use tracing::debug;
 
@@ -10,25 +11,24 @@ use super::output_helper::print_reference_location;
 use super::pack_checker::PackChecker;
 use super::CheckerInterface;
 use crate::packs::checker::Reference;
-use crate::packs::pack::Pack;
 use crate::packs::{Configuration, Sigil, Violation};
 
 /// Cycle violations are surfaced when an *implicit* dependency (one that
 /// would already produce a `dependency` violation) would close a dependency
 /// cycle if adopted explicitly.
 pub struct Checker {
-    /// Cached reachability info, built lazily on first `check` invocation.
-    /// `None` (the inner option) means we couldn't build the graph (e.g.
-    /// the configuration has a dependency referencing an unknown pack); in
-    /// that case we degrade gracefully and emit no cycle violations. The
-    /// user will see the actual misconfiguration from `pks validate`.
-    reachability: OnceLock<Option<Reachability>>,
+    /// Cached graph, built lazily on first `check` invocation. The inner
+    /// `Option` is `None` when the graph itself can't be built (e.g. a
+    /// pack's `dependencies:` lists an unknown pack); we treat this as
+    /// "no cycles to report" so a single misconfiguration doesn't blow up
+    /// `pks check`. `pks validate` is the right place to surface those errors.
+    graph: OnceLock<Option<OwnedDependencyGraph>>,
 }
 
 impl Checker {
     pub fn new() -> Self {
         Self {
-            reachability: OnceLock::new(),
+            graph: OnceLock::new(),
         }
     }
 }
@@ -39,23 +39,16 @@ impl Default for Checker {
     }
 }
 
-/// For each pack, the cached reachability info needed to detect cycles
-/// produced by adopting an implicit dependency.
-struct Reachability {
-    /// Adjacency list of declared dependencies, keyed by pack name.
-    /// `edges[A]` is every pack `A` directly declares as a dependency.
-    edges: HashMap<String, Vec<String>>,
-    /// `transitive_dependents[X]` is every pack that already transitively
-    /// depends on `X` via declared edges (excluding `X` itself).
-    transitive_dependents: HashMap<String, HashSet<String>>,
+/// Owned-string view over the declared dependency graph, suitable for caching
+/// behind `OnceLock`. The underlying `DependencyGraph<'a>` borrows `&Pack`s
+/// and can't outlive a single `check_all` call, so we copy the names out.
+struct OwnedDependencyGraph {
+    graph: DiGraph<(), ()>,
+    pack_to_node: HashMap<String, NodeIndex>,
+    node_to_pack: HashMap<NodeIndex, String>,
 }
 
-impl Reachability {
-    /// Builds reachability from declared dependencies. Returns `None` when
-    /// the graph itself can't be built (e.g. a pack's `dependencies:` lists
-    /// an unknown pack). The cycle checker treats this as "no cycles to
-    /// report" so a single misconfiguration doesn't blow up `pks check`;
-    /// `pks validate` is the right place to surface those errors.
+impl OwnedDependencyGraph {
     fn build(configuration: &Configuration) -> Option<Self> {
         let (dep_graph, _self_deps) =
             match build_dependency_graph(configuration) {
@@ -66,92 +59,42 @@ impl Reachability {
                 }
             };
 
-        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
-        for (&node, &pack) in &dep_graph.node_to_pack {
-            let outgoing: Vec<String> = dep_graph
-                .graph
-                .neighbors(node)
-                .map(|n| dep_graph.node_to_pack.get(&n).unwrap().name.clone())
-                .collect();
-            edges.insert(pack.name.clone(), outgoing);
-        }
-
-        let transitive_dependents = compute_transitive_dependents(
-            &dep_graph.graph,
-            &dep_graph.node_to_pack,
-        );
+        let pack_to_node = dep_graph
+            .pack_to_node
+            .iter()
+            .map(|(pack, &node)| (pack.name.clone(), node))
+            .collect();
+        let node_to_pack = dep_graph
+            .node_to_pack
+            .iter()
+            .map(|(&node, pack)| (node, pack.name.clone()))
+            .collect();
 
         Some(Self {
-            edges,
-            transitive_dependents,
+            graph: dep_graph.graph,
+            pack_to_node,
+            node_to_pack,
         })
     }
 
-    /// Shortest path from `from` to `to` along declared dependency edges, if
-    /// one exists. Returned path includes both endpoints.
+    /// Shortest path from `from` to `to` along declared dependency edges,
+    /// using A* with unit edge weights (effectively BFS by hop count).
+    /// Returned path includes both endpoints; `None` if `to` is unreachable
+    /// or either pack is unknown.
     fn shortest_path(&self, from: &str, to: &str) -> Option<Vec<String>> {
-        if from == to {
-            return Some(vec![from.to_string()]);
-        }
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<(String, Vec<String>)> = VecDeque::new();
-        queue.push_back((from.to_string(), vec![from.to_string()]));
-        visited.insert(from.to_string());
+        let from_node = *self.pack_to_node.get(from)?;
+        let to_node = *self.pack_to_node.get(to)?;
 
-        while let Some((current, path)) = queue.pop_front() {
-            let neighbors = match self.edges.get(&current) {
-                Some(n) => n,
-                None => continue,
-            };
-            for neighbor in neighbors {
-                if neighbor == to {
-                    let mut new_path = path.clone();
-                    new_path.push(neighbor.clone());
-                    return Some(new_path);
-                }
-                if visited.insert(neighbor.clone()) {
-                    let mut new_path = path.clone();
-                    new_path.push(neighbor.clone());
-                    queue.push_back((neighbor.clone(), new_path));
-                }
-            }
-        }
-        None
+        let (_, node_path) =
+            astar(&self.graph, from_node, |n| n == to_node, |_| 1, |_| 0)?;
+
+        Some(
+            node_path
+                .into_iter()
+                .map(|n| self.node_to_pack[&n].clone())
+                .collect(),
+        )
     }
-}
-
-/// Reverse-BFS from each node to compute, for every pack X, the set of packs
-/// that transitively depend on X via declared dependency edges.
-fn compute_transitive_dependents(
-    graph: &DiGraph<(), ()>,
-    node_to_pack: &HashMap<NodeIndex, &Pack>,
-) -> HashMap<String, HashSet<String>> {
-    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for (&start_node, &start_pack) in node_to_pack {
-        let mut reached: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
-        queue.push_back(start_node);
-        let mut seen: HashSet<NodeIndex> = HashSet::new();
-        seen.insert(start_node);
-
-        while let Some(current) = queue.pop_front() {
-            for predecessor in
-                graph.neighbors_directed(current, petgraph::Direction::Incoming)
-            {
-                if !seen.insert(predecessor) {
-                    continue;
-                }
-                let predecessor_pack = node_to_pack.get(&predecessor).unwrap();
-                reached.insert(predecessor_pack.name.clone());
-                queue.push_back(predecessor);
-            }
-        }
-
-        out.insert(start_pack.name.clone(), reached);
-    }
-
-    out
 }
 
 impl CheckerInterface for Checker {
@@ -193,36 +136,29 @@ impl CheckerInterface for Checker {
             return Ok(None);
         }
 
-        // Lazily initialize the reachability cache the first time we need it.
-        // Building once amortizes across the whole `check_all` run.
-        let reachability = self
-            .reachability
-            .get_or_init(|| Reachability::build(configuration));
-        let reachability = match reachability {
-            Some(r) => r,
+        // Lazily initialize the graph cache the first time we need it. Built
+        // once, amortizes across the whole `check_all` run.
+        let graph = self
+            .graph
+            .get_or_init(|| OwnedDependencyGraph::build(configuration));
+        let graph = match graph {
+            Some(g) => g,
             None => return Ok(None),
         };
 
         // Cycle exists iff `defining_pack` already (transitively) depends on
         // `referencing_pack` via declared edges. Adopting the implicit edge
-        // referencing -> defining would close the loop.
-        let dependents_of_referencing = match reachability
-            .transitive_dependents
-            .get(&referencing_pack.name)
+        // referencing -> defining would close the loop. `astar` answers both
+        // "is it reachable?" and "what's the shortest path?" in one call.
+        let declared_path = match graph
+            .shortest_path(&defining_pack.name, &referencing_pack.name)
         {
-            Some(set) => set,
+            Some(p) => p,
             None => return Ok(None),
         };
-        if !dependents_of_referencing.contains(&defining_pack.name) {
-            return Ok(None);
-        }
 
-        // Build the cycle path: implicit edge first, then the existing
-        // shortest declared path from defining back to referencing.
-        let declared_path = reachability
-            .shortest_path(&defining_pack.name, &referencing_pack.name)
-            .context("expected a declared path closing the cycle")?;
-
+        // Build the cycle path: implicit edge first, then the declared path
+        // back from defining to referencing.
         let mut cycle_path: Vec<String> = vec![referencing_pack.name.clone()];
         cycle_path.extend(declared_path);
         let cycle_detail = cycle_path.join(" -> ");
@@ -255,6 +191,7 @@ mod tests {
     };
     use crate::packs::pack::CheckerSetting;
     use crate::packs::{configuration, Pack, PackSet};
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     /// Three packs in a closed cycle: foo declares bar, bar declares baz, baz
