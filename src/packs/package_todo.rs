@@ -919,6 +919,95 @@ packs/bar:
     }
 
     #[test]
+    fn test_serialize_new_form_preserves_layer_detail() {
+        // detailed_violations = true: violations rendered as a YAML mapping,
+        // with `layer` carrying its detail string inline.
+        let mut violations: BTreeMap<String, Option<String>> = BTreeMap::new();
+        violations.insert(
+            "layer".to_string(),
+            Some("utilities < product".to_string()),
+        );
+        violations.insert("dependency".to_string(), None);
+
+        let mut group_map = BTreeMap::new();
+        group_map.insert(
+            "::Bar".to_string(),
+            ViolationGroup {
+                violations,
+                files: BTreeSet::from([
+                    "packs/foo/app/services/foo.rb".to_string()
+                ]),
+            },
+        );
+
+        let mut by_pack: BTreeMap<String, BTreeMap<String, ViolationGroup>> =
+            BTreeMap::new();
+        by_pack.insert("packs/bar".to_string(), group_map);
+
+        let pt = PackageTodo {
+            violations_by_defining_pack: by_pack,
+        };
+        let yml = serialize_package_todo(
+            &String::from("packs/foo"),
+            &pt,
+            false,
+            true,
+        );
+
+        let expected = String::from(
+            "\
+# This file contains a list of dependencies that are not part of the long term plan for the
+# 'packs/foo' package.
+# We should generally work to reduce this list over time.
+#
+# You can regenerate this file using the following command:
+#
+# bin/packwerk update-todo
+---
+packs/bar:
+  \"::Bar\":
+    violations:
+      dependency:
+      layer: utilities < product
+    files:
+    - packs/foo/app/services/foo.rb
+",
+        );
+        assert_eq!(expected, yml);
+    }
+
+    #[test]
+    fn test_deserialize_new_form_with_layer_detail() {
+        // The new mapping form must roundtrip: a YAML map where `layer`
+        // has an inline detail string should deserialize to a ViolationGroup
+        // with that detail set on the `layer` entry.
+        let contents: String = String::from(
+            "
+        packs/bar:
+            \"::Bar\":
+                violations:
+                  dependency:
+                  layer: utilities < product
+                files:
+                - packs/foo/app/services/foo.rb
+        ",
+        );
+
+        let actual: PackageTodo = serde_yaml::from_str(&contents).unwrap();
+        let group = actual
+            .violations_by_defining_pack
+            .get("packs/bar")
+            .and_then(|g| g.get("::Bar"))
+            .expect("expected ::Bar entry under packs/bar");
+
+        assert_eq!(group.violations.get("dependency"), Some(&None));
+        assert_eq!(
+            group.violations.get("layer"),
+            Some(&Some("utilities < product".to_string()))
+        );
+    }
+
+    #[test]
     fn test_merge_package_todo_adds_new_entries() {
         let base = PackageTodo {
             violations_by_defining_pack: {
