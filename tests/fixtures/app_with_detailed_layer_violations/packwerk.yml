@@ -1,0 +1,8 @@
+cache: false
+detailed_violations: true
+
+layers:
+  - tooling
+  - deprecated
+  - product
+  - utilities

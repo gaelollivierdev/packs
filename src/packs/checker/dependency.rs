@@ -11,14 +11,15 @@ use petgraph::algo::tarjan_scc;
 use petgraph::prelude::DiGraph;
 use petgraph::Direction;
 
-/// Build graph infrastructure shared by both validate and validate_structured.
-struct DependencyGraph<'a> {
-    graph: DiGraph<(), ()>,
-    pack_to_node: HashMap<&'a Pack, petgraph::prelude::NodeIndex>,
-    node_to_pack: HashMap<petgraph::prelude::NodeIndex, &'a Pack>,
+/// Build graph infrastructure shared by validate, validate_structured, and the
+/// cycle checker.
+pub(crate) struct DependencyGraph<'a> {
+    pub(crate) graph: DiGraph<(), ()>,
+    pub(crate) pack_to_node: HashMap<&'a Pack, petgraph::prelude::NodeIndex>,
+    pub(crate) node_to_pack: HashMap<petgraph::prelude::NodeIndex, &'a Pack>,
 }
 
-fn build_dependency_graph(
+pub(crate) fn build_dependency_graph(
     configuration: &Configuration,
 ) -> Result<(DependencyGraph<'_>, Vec<&Pack>), String> {
     let mut graph = DiGraph::<(), ()>::new();

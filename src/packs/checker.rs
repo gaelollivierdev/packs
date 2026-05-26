@@ -1,8 +1,9 @@
 // Module declarations
-mod dependency;
+pub(crate) mod dependency;
 pub(crate) mod layer;
 
 mod common_test;
+mod cycle;
 mod folder_privacy;
 mod output_helper;
 pub(crate) mod pack_checker;
@@ -60,12 +61,60 @@ pub struct ViolationIdentifier {
     pub constant_name: String,
     pub referencing_pack_name: String,
     pub defining_pack_name: String,
+    /// Type-specific extra information surfaced in `package_todo.yml`.
+    /// `None` for types without a sub-detail (e.g. `privacy`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 #[derive(PartialEq, Clone, Eq, Hash, Debug, Serialize)]
 pub struct Violation {
     pub message: String,
     pub identifier: ViolationIdentifier,
     pub source_location: crate::packs::SourceLocation,
+}
+
+/// Identity of a recorded violation excluding `details`. Used to support
+/// lenient matching: a recorded entry with `details = None` (which is what
+/// the legacy `package_todo.yml` list-form deserializes to) acts as a
+/// wildcard that matches any found violation of the same type.
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+struct RecordedKey {
+    violation_type: String,
+    strict: bool,
+    file: String,
+    constant_name: String,
+    referencing_pack_name: String,
+    defining_pack_name: String,
+}
+
+impl From<&ViolationIdentifier> for RecordedKey {
+    fn from(id: &ViolationIdentifier) -> Self {
+        RecordedKey {
+            violation_type: id.violation_type.clone(),
+            strict: id.strict,
+            file: id.file.clone(),
+            constant_name: id.constant_name.clone(),
+            referencing_pack_name: id.referencing_pack_name.clone(),
+            defining_pack_name: id.defining_pack_name.clone(),
+        }
+    }
+}
+
+fn is_recorded(
+    found: &ViolationIdentifier,
+    recorded_index: &HashMap<RecordedKey, Vec<Option<String>>>,
+) -> bool {
+    let Some(entries) = recorded_index.get(&RecordedKey::from(found)) else {
+        return false;
+    };
+    entries
+        .iter()
+        .any(|recorded_details| match recorded_details {
+            // Legacy list-form recorded entries lose the detail; treat them
+            // as wildcards so existing files stay valid until next `update`.
+            None => true,
+            Some(d) => found.details.as_deref() == Some(d.as_str()),
+        })
 }
 
 pub(crate) trait CheckerInterface {
@@ -184,6 +233,8 @@ struct JsonViolation {
     constant_name: String,
     referencing_pack_name: String,
     defining_pack_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
 }
 
 impl From<&Violation> for JsonViolation {
@@ -202,6 +253,7 @@ impl From<&Violation> for JsonViolation {
             constant_name: v.identifier.constant_name.clone(),
             referencing_pack_name: v.identifier.referencing_pack_name.clone(),
             defining_pack_name: v.identifier.defining_pack_name.clone(),
+            details: v.identifier.details.clone(),
         }
     }
 }
@@ -253,6 +305,21 @@ impl<'a> CheckAllBuilder<'a> {
         &mut self,
         recorded_violations: &HashSet<ViolationIdentifier>,
     ) -> HashSet<&'a Violation> {
+        // Index recorded identifiers by every field except `details`, with
+        // value being the set of recorded `details` values seen for that key.
+        // A found violation is "already recorded" if either an identical
+        // `details` was recorded OR a recorded entry has `details = None`
+        // (a wildcard, used for backward-compat with the legacy list form
+        // of `package_todo.yml`).
+        let mut recorded_index: HashMap<RecordedKey, Vec<Option<String>>> =
+            HashMap::new();
+        for id in recorded_violations {
+            recorded_index
+                .entry(RecordedKey::from(id))
+                .or_default()
+                .push(id.details.clone());
+        }
+
         let reportable_violations =
             if self.configuration.ignore_recorded_violations {
                 debug!("Filtering recorded violations is disabled in config");
@@ -261,7 +328,7 @@ impl<'a> CheckAllBuilder<'a> {
                 self.found_violations
                     .violations
                     .iter()
-                    .filter(|v| !recorded_violations.contains(&v.identifier))
+                    .filter(|v| !is_recorded(&v.identifier, &recorded_index))
                     .collect()
             };
         reportable_violations
@@ -763,7 +830,7 @@ fn get_all_violations(
 fn get_checkers(
     configuration: &Configuration,
 ) -> Vec<Box<dyn CheckerInterface + Send + Sync>> {
-    vec![
+    let mut checkers: Vec<Box<dyn CheckerInterface + Send + Sync>> = vec![
         Box::new(dependency::Checker {}),
         Box::new(privacy::Checker {}),
         Box::new(visibility::Checker {}),
@@ -771,7 +838,14 @@ fn get_checkers(
             layers: configuration.layers.clone(),
         }),
         Box::new(folder_privacy::Checker {}),
-    ]
+    ];
+    // The cycle checker is gated on `detailed_violations` because it produces
+    // a new violation type that didn't previously exist; existing projects
+    // would suddenly see violations they had no way to grandfather in.
+    if configuration.detailed_violations {
+        checkers.push(Box::new(cycle::Checker::new()));
+    }
+    checkers
 }
 
 fn remove_reference_to_dependency(
@@ -809,6 +883,7 @@ mod tests {
                         constant_name: "::Foo::PrivateClass".to_string(),
                         referencing_pack_name: "bar".to_string(),
                         defining_pack_name: "foo".to_string(),
+                        details: None,
                     },
                     source_location: SourceLocation { line: 10, column: 5 },
                 },
@@ -821,6 +896,7 @@ mod tests {
                         constant_name: "::Foo::AnotherClass".to_string(),
                         referencing_pack_name: "foo".to_string(),
                         defining_pack_name: "bar".to_string(),
+                        details: None,
                     },
                     source_location: SourceLocation { line: 15, column: 3 },
                 }

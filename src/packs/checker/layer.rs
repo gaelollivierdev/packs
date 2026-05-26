@@ -141,9 +141,13 @@ impl CheckerInterface for Checker {
                     referencing_layer,
                 );
 
+                let details =
+                    Some(format!("{} < {}", referencing_layer, defining_layer));
+
                 Ok(Some(Violation {
                     message,
-                    identifier: pack_checker.violation_identifier(),
+                    identifier: pack_checker
+                        .violation_identifier_with_details(details),
                     source_location: reference.source_location.clone(),
                 }))
             }
@@ -163,7 +167,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::packs::checker::common_test::tests::{
-        build_expected_violation, default_defining_pack,
+        build_expected_violation_with_details, default_defining_pack,
         default_referencing_pack, test_check, TestChecker,
     };
     use crate::packs::pack::EnforcementGlobsIgnore;
@@ -222,9 +226,10 @@ mod tests {
                 layer: Some("utilities".to_string()),
                 ..default_referencing_pack()
             },
-            expected_violation: Some(build_expected_violation(
-                "packs/foo/app/services/foo.rb:3:1\nLayer violation: `::Bar` belongs to `packs/bar` (whose layer is `product`) cannot be accessed from `packs/foo` (whose layer is `utilities`)".to_string(), 
-                "layer".to_string(), false)),
+            expected_violation: Some(build_expected_violation_with_details(
+                "packs/foo/app/services/foo.rb:3:1\nLayer violation: `::Bar` belongs to `packs/bar` (whose layer is `product`) cannot be accessed from `packs/foo` (whose layer is `utilities`)".to_string(),
+                "layer".to_string(), false,
+                Some("utilities < product".to_string()))),
         };
         test_check(&checker_with_layers(), &mut test_checker)
     }
@@ -246,9 +251,10 @@ mod tests {
                 layer: Some("utilities".to_string()),
                 ..default_referencing_pack()
             },
-            expected_violation: Some(build_expected_violation(
-                "packs/foo/app/services/foo.rb:3:1\nLayer violation: `::Bar` belongs to `packs/bar` (whose layer is `product`) cannot be accessed from `packs/foo` (whose layer is `utilities`)".to_string(), 
-                "layer".to_string(), true)),
+            expected_violation: Some(build_expected_violation_with_details(
+                "packs/foo/app/services/foo.rb:3:1\nLayer violation: `::Bar` belongs to `packs/bar` (whose layer is `product`) cannot be accessed from `packs/foo` (whose layer is `utilities`)".to_string(),
+                "layer".to_string(), true,
+                Some("utilities < product".to_string()))),
         };
         test_check(&checker_with_layers(), &mut test_checker)
     }

@@ -20,6 +20,7 @@ enum ViolationDirection {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ViolationType {
+    Cycle,
     Dependency,
     FolderPrivacy,
     Layer,
@@ -30,6 +31,7 @@ pub enum ViolationType {
 impl From<&str> for ViolationType {
     fn from(s: &str) -> Self {
         match s {
+            "cycle" => ViolationType::Cycle,
             "dependency" => ViolationType::Dependency,
             "folder_privacy" => ViolationType::FolderPrivacy,
             "layer" => ViolationType::Layer,
@@ -43,6 +45,7 @@ impl From<&str> for ViolationType {
 impl From<ViolationType> for &str {
     fn from(violation_type: ViolationType) -> &'static str {
         match violation_type {
+            ViolationType::Cycle => "cycle",
             ViolationType::Dependency => "dependency",
             ViolationType::FolderPrivacy => "folder_privacy",
             ViolationType::Layer => "layer",
@@ -70,9 +73,9 @@ impl<'a> PackChecker<'a> {
 
     fn violation_direction(&self) -> ViolationDirection {
         match self.violation_type {
-            ViolationType::Dependency | ViolationType::Layer => {
-                ViolationDirection::Outgoing
-            }
+            ViolationType::Cycle
+            | ViolationType::Dependency
+            | ViolationType::Layer => ViolationDirection::Outgoing,
             ViolationType::Privacy
             | ViolationType::FolderPrivacy
             | ViolationType::Visibility => ViolationDirection::Incoming,
@@ -112,7 +115,9 @@ impl<'a> PackChecker<'a> {
 
     fn rules_checker_setting(&self) -> &CheckerSetting {
         match self.violation_type {
-            ViolationType::Dependency => self
+            // Cycle violations piggyback on dependency enforcement: they only
+            // apply when the implicit dep itself would be a violation.
+            ViolationType::Cycle | ViolationType::Dependency => self
                 .checker_setting_for(&self.rules_pack().enforce_dependencies),
             ViolationType::FolderPrivacy => {
                 self.rules_pack().enforce_folder_privacy()
@@ -131,7 +136,7 @@ impl<'a> PackChecker<'a> {
 
     fn violation_globally_disabled(&self) -> bool {
         match self.violation_type {
-            ViolationType::Dependency => {
+            ViolationType::Cycle | ViolationType::Dependency => {
                 self.configuration.disable_enforce_dependencies
             }
             ViolationType::FolderPrivacy => {
@@ -180,6 +185,13 @@ impl<'a> PackChecker<'a> {
     }
 
     pub fn violation_identifier(&self) -> ViolationIdentifier {
+        self.violation_identifier_with_details(None)
+    }
+
+    pub fn violation_identifier_with_details(
+        &self,
+        details: Option<String>,
+    ) -> ViolationIdentifier {
         let violation_type: &str = self.violation_type.into();
         ViolationIdentifier {
             violation_type: violation_type.to_string(),
@@ -188,6 +200,7 @@ impl<'a> PackChecker<'a> {
             constant_name: self.reference.constant_name.clone(),
             referencing_pack_name: self.referencing_pack.name.clone(),
             defining_pack_name: self.defining_pack.unwrap().name.clone(),
+            details,
         }
     }
 }

@@ -1,7 +1,8 @@
 #[allow(deprecated)]
 use assert_cmd::cargo::cargo_bin;
 use assert_cmd::prelude::*;
-use std::{error::Error, process::Command};
+use pretty_assertions::assert_eq;
+use std::{error::Error, path::Path, process::Command};
 
 mod common;
 #[test]
@@ -37,6 +38,50 @@ fn test_check_enforce_layers_disabled() -> Result<(), Box<dyn Error>> {
         .arg("check")
         .assert()
         .success();
+
+    common::teardown();
+    Ok(())
+}
+
+#[test]
+fn test_update_emits_layer_detail_when_detailed_violations_enabled(
+) -> Result<(), Box<dyn Error>> {
+    // The fixture has `detailed_violations: true` in packwerk.yml; running
+    // `pks update` should record the layer violation in the new map form
+    // with a `<referencing_layer> < <defining_layer>` detail string.
+    let package_todo_yml_filepath = Path::new(
+        "tests/fixtures/app_with_detailed_layer_violations/packs/feature_flags/package_todo.yml",
+    );
+    let _ = std::fs::remove_file(package_todo_yml_filepath);
+
+    Command::new(cargo_bin!("packs"))
+        .arg("--project-root")
+        .arg("tests/fixtures/app_with_detailed_layer_violations")
+        .arg("update")
+        .assert()
+        .success();
+
+    let actual = std::fs::read_to_string(package_todo_yml_filepath)?;
+    let expected = String::from(
+        "\
+# This file contains a list of dependencies that are not part of the long term plan for the
+# 'packs/feature_flags' package.
+# We should generally work to reduce this list over time.
+#
+# You can regenerate this file using the following command:
+#
+# bin/packwerk update-todo
+---
+packs/payments:
+  \"::Payments\":
+    violations:
+      layer: utilities < product
+    files:
+    - packs/feature_flags/app/services/feature_flags.rb
+",
+    );
+    std::fs::remove_file(package_todo_yml_filepath)?;
+    assert_eq!(expected, actual);
 
     common::teardown();
     Ok(())

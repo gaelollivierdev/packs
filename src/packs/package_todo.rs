@@ -1,6 +1,10 @@
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{
+    ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::debug;
 
@@ -36,23 +40,64 @@ fn count_violations(package_todo: &PackageTodo) -> usize {
 
 #[derive(PartialEq, Debug, Eq, Deserialize, Serialize, Default, Clone)]
 pub struct ViolationGroup {
-    // Use serde rename to parse the key as violations
-    #[serde(rename = "violations", serialize_with = "serialize_sorted_set")]
-    pub violation_types: HashSet<String>,
-    #[serde(serialize_with = "serialize_sorted_set")]
-    pub files: HashSet<String>,
+    /// Map of violation type (e.g. `dependency`, `layer`, `cycle`) to an
+    /// optional human-readable detail string.
+    ///
+    /// Always serializes as a YAML mapping. Deserialization additionally
+    /// accepts the legacy sequence form (`violations: [layer, dependency]`),
+    /// in which case detail values become `None`.
+    #[serde(deserialize_with = "deserialize_violations")]
+    pub violations: BTreeMap<String, Option<String>>,
+    pub files: BTreeSet<String>,
 }
 
-fn serialize_sorted_set<S>(
-    set: &HashSet<String>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+/// Custom deserializer that accepts both the new mapping form
+/// (`violations: { layer: "a < b", dependency: ~ }`) and the legacy sequence
+/// form (`violations: [dependency, layer]`).
+fn deserialize_violations<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Option<String>>, D::Error>
 where
-    S: Serializer,
+    D: Deserializer<'de>,
 {
-    let mut sorted_files: Vec<&String> = set.iter().collect();
-    sorted_files.sort();
-    sorted_files.serialize(serializer)
+    struct ViolationsVisitor;
+
+    impl<'de> Visitor<'de> for ViolationsVisitor {
+        type Value = BTreeMap<String, Option<String>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str(
+                "a sequence of violation type strings or a mapping of \
+                 violation type to optional detail string",
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = BTreeMap::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.insert(item, None);
+            }
+            Ok(out)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) =
+                map.next_entry::<String, Option<String>>()?
+            {
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(ViolationsVisitor)
 }
 
 #[derive(PartialEq, Eq, Debug, Deserialize, Serialize, Default, Clone)]
@@ -145,9 +190,24 @@ pub fn package_todos_for_pack_name(
             violation_group
                 .files
                 .insert(violation.identifier.file.to_owned());
-            violation_group
-                .violation_types
-                .insert(violation.identifier.violation_type.to_owned());
+
+            // If two violations of the same type carry different details,
+            // we keep the lexicographically smaller one for determinism.
+            // In practice this only matters for the `cycle` type, where we
+            // already canonicalize to the shortest path before this point.
+            let entry = violation_group
+                .violations
+                .entry(violation.identifier.violation_type.to_owned())
+                .or_insert_with(|| violation.identifier.details.clone());
+            if let (Some(existing), Some(new)) =
+                (entry.as_ref(), &violation.identifier.details)
+            {
+                if new < existing {
+                    *entry = Some(new.clone());
+                }
+            } else if entry.is_none() {
+                *entry = violation.identifier.details.clone();
+            }
         }
 
         let package_todo = PackageTodo {
@@ -227,6 +287,7 @@ pub fn write_violations_to_disk(
                     p,
                     package_todo,
                     configuration.packs_first_mode,
+                    configuration.detailed_violations,
                 );
             }
             None => {
@@ -263,9 +324,25 @@ fn merge_package_todo(base: &PackageTodo, new: &PackageTodo) -> PackageTodo {
             existing_group
                 .files
                 .extend(violation_group.files.iter().cloned());
-            existing_group
-                .violation_types
-                .extend(violation_group.violation_types.iter().cloned());
+            for (violation_type, details) in &violation_group.violations {
+                existing_group
+                    .violations
+                    .entry(violation_type.clone())
+                    .and_modify(|existing_details| {
+                        // Prefer any non-None over None; otherwise keep the
+                        // lexicographically smaller for determinism.
+                        match (existing_details.as_ref(), details.as_ref()) {
+                            (None, Some(_)) => {
+                                *existing_details = details.clone();
+                            }
+                            (Some(existing), Some(new)) if new < existing => {
+                                *existing_details = details.clone();
+                            }
+                            _ => {}
+                        }
+                    })
+                    .or_insert_with(|| details.clone());
+            }
         }
     }
     merged
@@ -321,6 +398,7 @@ pub fn merge_violations_to_disk(
                     p,
                     &merged,
                     configuration.packs_first_mode,
+                    configuration.detailed_violations,
                 );
             }
         }
@@ -346,6 +424,7 @@ pub fn lint_package_todo_yml_files(configuration: &Configuration) {
                 p,
                 &p.package_todo,
                 configuration.packs_first_mode,
+                configuration.detailed_violations,
             );
         }
     });
@@ -355,20 +434,94 @@ fn serialize_package_todo(
     responsible_pack_name: &String,
     package_todo: &PackageTodo,
     packs_first_mode: bool,
+    detailed_violations: bool,
 ) -> String {
-    let package_todo_yml = serde_yaml::to_string(&package_todo).unwrap();
+    let package_todo_yml = if detailed_violations {
+        serde_yaml::to_string(&package_todo).unwrap()
+    } else {
+        serde_yaml::to_string(&PackageTodoLegacyView(package_todo)).unwrap()
+    };
 
     // HACK: This is the other part of the hack above (search `HACK:` for more)
     let package_todo_yml = package_todo_yml.replace("'#", "\"");
     let package_todo_yml = package_todo_yml.replace("#'", "\"");
+    // Render `Option::<String>::None` violation values as an empty YAML value
+    // (`dependency:`) instead of the noisier `dependency: null`. Both are
+    // semantically identical in YAML; the empty form is easier to read. Only
+    // applies in detailed mode; the legacy view emits sequences, never nulls.
+    let package_todo_yml = if detailed_violations {
+        package_todo_yml.replace(": null\n", ":\n")
+    } else {
+        package_todo_yml
+    };
     let header = header(responsible_pack_name, packs_first_mode);
     header + &package_todo_yml
+}
+
+/// Serialize-only view that renders `violations:` as a YAML sequence
+/// (legacy form) instead of a mapping. Used when `detailed_violations` is
+/// off so existing projects keep the original on-disk layout.
+struct PackageTodoLegacyView<'a>(&'a PackageTodo);
+
+impl<'a> Serialize for PackageTodoLegacyView<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let map = &self.0.violations_by_defining_pack;
+        let mut map_serializer = serializer.serialize_map(Some(map.len()))?;
+
+        for (key, value) in map {
+            // Mirror the constant-quoting hack used by the detailed
+            // serializer: serde_yaml emits keys without quotes by default,
+            // but we need quoted constant names like `"::Bar"`. Wrap each
+            // key in `#...#` and post-process the YAML text to swap the
+            // single quotes for double quotes.
+            let mut quoted_sorted: BTreeMap<String, ViolationGroupLegacyView> =
+                BTreeMap::new();
+            for (constant_name, violation_group) in value {
+                let quoted_constant_name = format!("#{}#", constant_name);
+                quoted_sorted.insert(
+                    quoted_constant_name,
+                    ViolationGroupLegacyView(violation_group),
+                );
+            }
+            let modified_key = if key == &String::from(".") {
+                String::from("#.#")
+            } else {
+                key.to_owned()
+            };
+            map_serializer.serialize_entry(&modified_key, &quoted_sorted)?;
+        }
+
+        map_serializer.end()
+    }
+}
+
+struct ViolationGroupLegacyView<'a>(&'a ViolationGroup);
+
+impl<'a> Serialize for ViolationGroupLegacyView<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ViolationGroup", 2)?;
+        // Drop the per-type detail entirely in legacy mode: emit sorted
+        // type names as a sequence. Equivalent to the old
+        // `HashSet<String>` shape after sorting.
+        let types: Vec<&String> = self.0.violations.keys().collect();
+        s.serialize_field("violations", &types)?;
+        s.serialize_field("files", &self.0.files)?;
+        s.end()
+    }
 }
 
 fn write_package_todo_to_disk(
     responsible_pack: &Pack,
     package_todo: &PackageTodo,
     packs_first_mode: bool,
+    detailed_violations: bool,
 ) {
     let package_todo_yml_absolute_filepath = responsible_pack
         .yml
@@ -384,6 +537,7 @@ fn write_package_todo_to_disk(
         &responsible_pack.name,
         package_todo,
         packs_first_mode,
+        detailed_violations,
     );
 
     std::fs::write(package_todo_yml_absolute_filepath, package_todo_yml)
@@ -428,28 +582,23 @@ mod tests {
 
     fn construct_violations(
         constant_name: String,
-        input_types: Vec<String>,
+        input_types: Vec<(String, Option<String>)>,
         input_files: Vec<String>,
     ) -> BTreeMap<String, ViolationGroup> {
         let mut bar_violations = BTreeMap::new();
-        let mut files = HashSet::new();
-        let mut violation_types = HashSet::new();
+        let mut files = BTreeSet::new();
+        let mut violations = BTreeMap::new();
 
         for file in input_files {
             files.insert(file);
         }
 
-        for violation_type in input_types {
-            violation_types.insert(violation_type);
+        for (violation_type, details) in input_types {
+            violations.insert(violation_type, details);
         }
 
-        bar_violations.insert(
-            constant_name,
-            ViolationGroup {
-                violation_types,
-                files,
-            },
-        );
+        bar_violations
+            .insert(constant_name, ViolationGroup { violations, files });
 
         bar_violations
     }
@@ -457,7 +606,7 @@ mod tests {
     fn bar_violations() -> BTreeMap<String, ViolationGroup> {
         construct_violations(
             String::from("::Bar"),
-            vec![String::from("dependency")],
+            vec![(String::from("dependency"), None)],
             vec![String::from("packs/foo/app/services/foo.rb")],
         )
     }
@@ -465,7 +614,7 @@ mod tests {
     fn bar_blah_violations() -> BTreeMap<String, ViolationGroup> {
         construct_violations(
             String::from("::BarBlah"),
-            vec![String::from("dependency")],
+            vec![(String::from("dependency"), None)],
             vec![String::from("packs/foo/app/services/foo.rb")],
         )
     }
@@ -473,7 +622,10 @@ mod tests {
     fn baz_violations() -> BTreeMap<String, ViolationGroup> {
         construct_violations(
             String::from("::Baz"),
-            vec![String::from("dependency"), String::from("privacy")],
+            vec![
+                (String::from("dependency"), None),
+                (String::from("privacy"), None),
+            ],
             vec![String::from("packs/foo/app/services/foo.rb")],
         )
     }
@@ -550,18 +702,18 @@ mod tests {
 packs/bar:
   \"::Bar\":
     violations:
-    - dependency
+      dependency:
     files:
     - packs/foo/app/services/foo.rb
   \"::BarBlah\":
     violations:
-    - dependency
+      dependency:
     files:
     - packs/foo/app/services/foo.rb
   \"::Baz\":
     violations:
-    - dependency
-    - privacy
+      dependency:
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -573,6 +725,7 @@ packs/bar:
             &String::from("packs/foo"),
             &actual_package_todo,
             false,
+            true,
         );
 
         assert_eq!(expected, actual);
@@ -593,18 +746,18 @@ packs/bar:
 \".\":
   \"::Bar\":
     violations:
-    - dependency
+      dependency:
     files:
     - packs/foo/app/services/foo.rb
   \"::BarBlah\":
     violations:
-    - dependency
+      dependency:
     files:
     - packs/foo/app/services/foo.rb
   \"::Baz\":
     violations:
-    - dependency
-    - privacy
+      dependency:
+      privacy:
     files:
     - packs/foo/app/services/foo.rb
 ",
@@ -615,6 +768,7 @@ packs/bar:
             &String::from("packs/foo"),
             &actual_package_todo,
             false,
+            true,
         );
 
         assert_eq!(expected, actual);
@@ -635,6 +789,52 @@ packs/bar:
 packs/bar:
   \"::Bar\":
     violations:
+      dependency:
+    files:
+    - packs/foo/app/services/foo.rb
+  \"::BarBlah\":
+    violations:
+      dependency:
+    files:
+    - packs/foo/app/services/foo.rb
+  \"::Baz\":
+    violations:
+      dependency:
+      privacy:
+    files:
+    - packs/foo/app/services/foo.rb
+",
+);
+
+        let actual_package_todo =
+            example_package_todo(String::from("packs/bar"));
+        let actual = serialize_package_todo(
+            &String::from("packs/foo"),
+            &actual_package_todo,
+            true,
+            true,
+        );
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_serialize_legacy_form_when_detailed_violations_off() {
+        // detailed_violations = false: violations rendered as a YAML
+        // sequence, mirroring the format pks emitted before this feature.
+        let expected: String = String::from(
+            "\
+# This file contains a list of dependencies that are not part of the long term plan for the
+# 'packs/foo' package.
+# We should generally work to reduce this list over time.
+#
+# You can regenerate this file using the following command:
+#
+# bin/packwerk update-todo
+---
+packs/bar:
+  \"::Bar\":
+    violations:
     - dependency
     files:
     - packs/foo/app/services/foo.rb
@@ -650,17 +850,161 @@ packs/bar:
     files:
     - packs/foo/app/services/foo.rb
 ",
-);
+        );
 
         let actual_package_todo =
             example_package_todo(String::from("packs/bar"));
         let actual = serialize_package_todo(
             &String::from("packs/foo"),
             &actual_package_todo,
-            true,
+            false,
+            false,
         );
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_serialize_legacy_form_drops_details() {
+        // Even if violations carry details (e.g. a layer detail set by the
+        // checker), the legacy serializer should drop them. This guarantees
+        // the on-disk format stays stable when a project has detailed_violations off.
+        let mut violations: BTreeMap<String, Option<String>> = BTreeMap::new();
+        violations.insert(
+            "layer".to_string(),
+            Some("utilities < product".to_string()),
+        );
+        violations.insert("dependency".to_string(), None);
+
+        let mut group_map = BTreeMap::new();
+        group_map.insert(
+            "::Bar".to_string(),
+            ViolationGroup {
+                violations,
+                files: BTreeSet::from([
+                    "packs/foo/app/services/foo.rb".to_string()
+                ]),
+            },
+        );
+
+        let mut by_pack: BTreeMap<String, BTreeMap<String, ViolationGroup>> =
+            BTreeMap::new();
+        by_pack.insert("packs/bar".to_string(), group_map);
+
+        let pt = PackageTodo {
+            violations_by_defining_pack: by_pack,
+        };
+        let yml = serialize_package_todo(
+            &String::from("packs/foo"),
+            &pt,
+            false,
+            false,
+        );
+
+        assert!(
+            yml.contains("- dependency"),
+            "expected legacy sequence form: {}",
+            yml
+        );
+        assert!(
+            yml.contains("- layer"),
+            "expected legacy sequence form: {}",
+            yml
+        );
+        assert!(
+            !yml.contains("utilities < product"),
+            "legacy form must not leak detail strings: {}",
+            yml
+        );
+    }
+
+    #[test]
+    fn test_serialize_new_form_preserves_layer_detail() {
+        // detailed_violations = true: violations rendered as a YAML mapping,
+        // with `layer` carrying its detail string inline.
+        let mut violations: BTreeMap<String, Option<String>> = BTreeMap::new();
+        violations.insert(
+            "layer".to_string(),
+            Some("utilities < product".to_string()),
+        );
+        violations.insert("dependency".to_string(), None);
+
+        let mut group_map = BTreeMap::new();
+        group_map.insert(
+            "::Bar".to_string(),
+            ViolationGroup {
+                violations,
+                files: BTreeSet::from([
+                    "packs/foo/app/services/foo.rb".to_string()
+                ]),
+            },
+        );
+
+        let mut by_pack: BTreeMap<String, BTreeMap<String, ViolationGroup>> =
+            BTreeMap::new();
+        by_pack.insert("packs/bar".to_string(), group_map);
+
+        let pt = PackageTodo {
+            violations_by_defining_pack: by_pack,
+        };
+        let yml = serialize_package_todo(
+            &String::from("packs/foo"),
+            &pt,
+            false,
+            true,
+        );
+
+        let expected = String::from(
+            "\
+# This file contains a list of dependencies that are not part of the long term plan for the
+# 'packs/foo' package.
+# We should generally work to reduce this list over time.
+#
+# You can regenerate this file using the following command:
+#
+# bin/packwerk update-todo
+---
+packs/bar:
+  \"::Bar\":
+    violations:
+      dependency:
+      layer: utilities < product
+    files:
+    - packs/foo/app/services/foo.rb
+",
+        );
+        assert_eq!(expected, yml);
+    }
+
+    #[test]
+    fn test_deserialize_new_form_with_layer_detail() {
+        // The new mapping form must roundtrip: a YAML map where `layer`
+        // has an inline detail string should deserialize to a ViolationGroup
+        // with that detail set on the `layer` entry.
+        let contents: String = String::from(
+            "
+        packs/bar:
+            \"::Bar\":
+                violations:
+                  dependency:
+                  layer: utilities < product
+                files:
+                - packs/foo/app/services/foo.rb
+        ",
+        );
+
+        let actual: PackageTodo = serde_yaml::from_str(&contents).unwrap();
+        let group = actual
+            .violations_by_defining_pack
+            .get("packs/bar")
+            .and_then(|g| g.get("::Bar"))
+            .expect("expected ::Bar entry under packs/bar");
+
+        assert_eq!(group.violations.get("dependency"), Some(&None));
+        assert_eq!(
+            group.violations.get("layer"),
+            Some(&Some("utilities < product".to_string()))
+        );
     }
 
     #[test]
@@ -696,8 +1040,8 @@ packs/bar:
         base_violations.insert(
             "::Bar".to_string(),
             ViolationGroup {
-                violation_types: HashSet::from(["dependency".to_string()]),
-                files: HashSet::from(["file_a.rb".to_string()]),
+                violations: BTreeMap::from([("dependency".to_string(), None)]),
+                files: BTreeSet::from(["file_a.rb".to_string()]),
             },
         );
         let base = PackageTodo {
@@ -712,8 +1056,8 @@ packs/bar:
         new_violations.insert(
             "::Bar".to_string(),
             ViolationGroup {
-                violation_types: HashSet::from(["privacy".to_string()]),
-                files: HashSet::from(["file_b.rb".to_string()]),
+                violations: BTreeMap::from([("privacy".to_string(), None)]),
+                files: BTreeSet::from(["file_b.rb".to_string()]),
             },
         );
         let new = PackageTodo {
@@ -728,8 +1072,8 @@ packs/bar:
         let group = &merged.violations_by_defining_pack["packs/bar"]["::Bar"];
         assert!(group.files.contains("file_a.rb"));
         assert!(group.files.contains("file_b.rb"));
-        assert!(group.violation_types.contains("dependency"));
-        assert!(group.violation_types.contains("privacy"));
+        assert!(group.violations.contains_key("dependency"));
+        assert!(group.violations.contains_key("privacy"));
     }
 
     #[test]

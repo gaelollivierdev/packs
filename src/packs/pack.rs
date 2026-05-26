@@ -182,7 +182,7 @@ impl Pack {
         let violations_by_pack = &self.package_todo.violations_by_defining_pack;
         for (defining_pack_name, violation_groups) in violations_by_pack {
             for (constant_name, violation_group) in violation_groups {
-                for violation_type in &violation_group.violation_types {
+                for (violation_type, details) in &violation_group.violations {
                     for file in &violation_group.files {
                         let identifier = ViolationIdentifier {
                             violation_type: violation_type.clone(),
@@ -191,6 +191,7 @@ impl Pack {
                             constant_name: constant_name.clone(),
                             referencing_pack_name: self.name.clone(),
                             defining_pack_name: defining_pack_name.clone(),
+                            details: details.clone(),
                         };
 
                         violations.push(identifier);
@@ -827,6 +828,7 @@ enforcement_globs_ignore:
                 constant_name: "::Bar".to_string(),
                 referencing_pack_name: "packs/foo".to_string(),
                 defining_pack_name: "packs/bar".to_string(),
+                details: None,
             },
             ViolationIdentifier {
                 violation_type: "dependency".to_string(),
@@ -835,6 +837,7 @@ enforcement_globs_ignore:
                 constant_name: "::Bar".to_string(),
                 referencing_pack_name: "packs/foo".to_string(),
                 defining_pack_name: "packs/bar".to_string(),
+                details: None,
             },
         ];
 

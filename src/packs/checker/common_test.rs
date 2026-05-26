@@ -47,6 +47,37 @@ pub mod tests {
         strict: bool,
         constant_name: String,
     ) -> Violation {
+        build_expected_violation_with_constant_and_details(
+            message,
+            violation_type,
+            strict,
+            constant_name,
+            None,
+        )
+    }
+
+    pub fn build_expected_violation_with_details(
+        message: String,
+        violation_type: String,
+        strict: bool,
+        details: Option<String>,
+    ) -> Violation {
+        build_expected_violation_with_constant_and_details(
+            message,
+            violation_type,
+            strict,
+            String::from("::Bar"),
+            details,
+        )
+    }
+
+    pub fn build_expected_violation_with_constant_and_details(
+        message: String,
+        violation_type: String,
+        strict: bool,
+        constant_name: String,
+        details: Option<String>,
+    ) -> Violation {
         Violation {
             message,
             identifier: ViolationIdentifier {
@@ -56,6 +87,7 @@ pub mod tests {
                 constant_name,
                 referencing_pack_name: String::from("packs/foo"),
                 defining_pack_name: String::from("packs/bar"),
+                details,
             },
             source_location: SourceLocation { line: 3, column: 1 },
         }
